@@ -1,0 +1,394 @@
+//+------------------------------------------------------------------+
+//|                    Trading Bot - Martingale with 3-Loss Reset    |
+//|                           Translated from DBot XML               |
+//|                                                                  |
+//| Strategy: Bollinger Bands + RSI + EMA with Martingale           |
+//| Reset: After 3 consecutive losses, reset stake to base           |
+//+------------------------------------------------------------------+
+
+#property copyright "Trading Bot"
+#property link      ""
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+//--- Global Variables (Initialization)
+double base_stake = 1.0;           // Initial stake (in lots or points)
+double current_stake = 1.0;        // Current trading stake
+int tick_counter = 0;              // Cooldown counter (3 ticks after trade)
+double martingale_multiplier = 2.1; // Multiplier for martingale on loss
+
+//--- Indicator Variables
+double upper_band = 0.0;           // Bollinger Band Upper
+double middle_band = 0.0;          // Bollinger Band Middle (SMA)
+double lower_band = 0.0;           // Bollinger Band Lower
+double bb_width = 0.0;             // Width of BB (Upper - Lower)
+double rsi_value = 0.0;            // RSI(14)
+double ema_fast = 0.0;             // EMA(15)
+double ema_slow = 0.0;             // EMA(50)
+
+//--- 3-Loss Reset Variables
+int consecutive_losses = 0;        // Counter for consecutive losses
+
+//--- Bollinger Bands Parameters
+int bb_period = 15;                // Period for BB
+double bb_dev_up = 2.0;            // Standard deviation multiplier
+double bb_dev_down = 2.0;
+
+//--- RSI Parameters
+int rsi_period = 14;
+
+//--- EMA Parameters
+int ema_fast_period = 15;
+int ema_slow_period = 50;
+
+//--- Entry Thresholds
+double bb_width_min = 0.2;         // Minimum BB width
+double bb_width_max = 0.9;         // Maximum BB width
+int rsi_call_min = 60;             // RSI threshold for CALL
+int rsi_call_max = 70;
+int rsi_put_min = 30;              // RSI threshold for PUT
+int rsi_put_max = 40;
+
+//--- Indicator Handles
+int handle_bb = INVALID_HANDLE;
+int handle_rsi = INVALID_HANDLE;
+int handle_ema_fast = INVALID_HANDLE;
+int handle_ema_slow = INVALID_HANDLE;
+
+//--- Trade Object
+CTrade trade;
+
+//--- Position Management
+ulong last_deal_ticket = 0;
+datetime last_trade_time = 0;
+ENUM_ORDER_TYPE last_trade_type = ORDER_TYPE_BUY;
+
+//--- Symbol Info
+MqlTick latest_tick;
+
+//+------------------------------------------------------------------+
+//| Expert Initialization Function                                  |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize Bollinger Bands
+   handle_bb = iBands(_Symbol, _Period, bb_period, 0, bb_dev_up, PRICE_CLOSE);
+   if(handle_bb == INVALID_HANDLE)
+   {
+      PrintFormat("Error creating Bollinger Bands indicator: %d", GetLastError());
+      return INIT_FAILED;
+   }
+
+   // Initialize RSI
+   handle_rsi = iRSI(_Symbol, _Period, rsi_period, PRICE_CLOSE);
+   if(handle_rsi == INVALID_HANDLE)
+   {
+      PrintFormat("Error creating RSI indicator: %d", GetLastError());
+      return INIT_FAILED;
+   }
+
+   // Initialize EMA Fast
+   handle_ema_fast = iMA(_Symbol, _Period, ema_fast_period, 0, MODE_EMA, PRICE_CLOSE);
+   if(handle_ema_fast == INVALID_HANDLE)
+   {
+      PrintFormat("Error creating EMA Fast indicator: %d", GetLastError());
+      return INIT_FAILED;
+   }
+
+   // Initialize EMA Slow
+   handle_ema_slow = iMA(_Symbol, _Period, ema_slow_period, 0, MODE_EMA, PRICE_CLOSE);
+   if(handle_ema_slow == INVALID_HANDLE)
+   {
+      PrintFormat("Error creating EMA Slow indicator: %d", GetLastError());
+      return INIT_FAILED;
+   }
+
+   // Initialize variables
+   base_stake = 1.0;
+   current_stake = base_stake;
+   martingale_multiplier = 2.1;
+   tick_counter = 0;
+   consecutive_losses = 0;
+
+   PrintFormat("Expert Advisor initialized successfully");
+   PrintFormat("Base Stake: %.2f, Multiplier: %.2f", base_stake, martingale_multiplier);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert Deinitialization Function                                |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Release indicator handles
+   if(handle_bb != INVALID_HANDLE)
+      IndicatorRelease(handle_bb);
+   if(handle_rsi != INVALID_HANDLE)
+      IndicatorRelease(handle_rsi);
+   if(handle_ema_fast != INVALID_HANDLE)
+      IndicatorRelease(handle_ema_fast);
+   if(handle_ema_slow != INVALID_HANDLE)
+      IndicatorRelease(handle_ema_slow);
+
+   PrintFormat("Expert Advisor deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert Tick Function (Main Loop)                                |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Get latest tick information
+   if(!SymbolInfoTick(_Symbol, latest_tick))
+   {
+      PrintFormat("Error getting tick info: %d", GetLastError());
+      return;
+   }
+
+   // Check if we need to wait (cooldown after trade)
+   if(tick_counter > 0)
+   {
+      tick_counter--;
+      return; // Wait during cooldown
+   }
+
+   // ============================================================
+   // CALCULATE ALL INDICATORS
+   // ============================================================
+
+   // Calculate Bollinger Bands
+   double bb_upper_array[], bb_middle_array[], bb_lower_array[];
+   ArraySetAsSeries(bb_upper_array, true);
+   ArraySetAsSeries(bb_middle_array, true);
+   ArraySetAsSeries(bb_lower_array, true);
+
+   if(CopyBuffer(handle_bb, 1, 0, 1, bb_upper_array) <= 0 ||
+      CopyBuffer(handle_bb, 0, 0, 1, bb_middle_array) <= 0 ||
+      CopyBuffer(handle_bb, 2, 0, 1, bb_lower_array) <= 0)
+   {
+      PrintFormat("Error copying Bollinger Bands data: %d", GetLastError());
+      return;
+   }
+
+   upper_band = bb_upper_array[0];
+   middle_band = bb_middle_array[0];
+   lower_band = bb_lower_array[0];
+   bb_width = upper_band - lower_band;
+
+   // Calculate RSI
+   double rsi_array[];
+   ArraySetAsSeries(rsi_array, true);
+   if(CopyBuffer(handle_rsi, 0, 0, 1, rsi_array) <= 0)
+   {
+      PrintFormat("Error copying RSI data: %d", GetLastError());
+      return;
+   }
+   rsi_value = rsi_array[0];
+
+   // Calculate EMA Fast
+   double ema_fast_array[];
+   ArraySetAsSeries(ema_fast_array, true);
+   if(CopyBuffer(handle_ema_fast, 0, 0, 1, ema_fast_array) <= 0)
+   {
+      PrintFormat("Error copying EMA Fast data: %d", GetLastError());
+      return;
+   }
+   ema_fast = ema_fast_array[0];
+
+   // Calculate EMA Slow
+   double ema_slow_array[];
+   ArraySetAsSeries(ema_slow_array, true);
+   if(CopyBuffer(handle_ema_slow, 0, 0, 1, ema_slow_array) <= 0)
+   {
+      PrintFormat("Error copying EMA Slow data: %d", GetLastError());
+      return;
+   }
+   ema_slow = ema_slow_array[0];
+
+   // Get current price from latest tick
+   double current_price = latest_tick.last;
+
+   // ============================================================
+   // ENTRY DECISION LOGIC
+   // ============================================================
+
+   // Check if there's already an open position
+   bool has_position = HasOpenPosition();
+
+   // CALL Conditions
+   bool call_conditions =
+      (current_price > middle_band) &&                           // Price above middle band
+      (bb_width > bb_width_min) &&                              // BB width check (min)
+      (bb_width < bb_width_max) &&                              // BB width check (max)
+      (rsi_value > rsi_call_min) &&                             // RSI threshold (min)
+      (rsi_value < rsi_call_max) &&                             // RSI threshold (max)
+      (ema_fast > ema_slow) &&                                  // EMA trend confirmation
+      (!has_position);                                           // No open position
+
+   // PUT Conditions
+   bool put_conditions =
+      (current_price < middle_band) &&                           // Price below middle band
+      (bb_width > bb_width_min) &&                              // BB width check (min)
+      (bb_width < bb_width_max) &&                              // BB width check (max)
+      (rsi_value < rsi_put_max) &&                              // RSI threshold (max)
+      (rsi_value > rsi_put_min) &&                              // RSI threshold (min)
+      (ema_fast < ema_slow) &&                                  // EMA trend confirmation
+      (!has_position);                                           // No open position
+
+   // Log indicator values for debugging
+   static datetime last_log_time = 0;
+   if(TimeCurrent() - last_log_time >= 60) // Log every 60 seconds
+   {
+      last_log_time = TimeCurrent();
+      PrintFormat("=== INDICATORS ===");
+      PrintFormat("Price: %.5f | BB_Mid: %.5f | BB_Width: %.5f",
+                  current_price, middle_band, bb_width);
+      PrintFormat("RSI: %.2f | EMA_Fast: %.5f | EMA_Slow: %.5f",
+                  rsi_value, ema_fast, ema_slow);
+      PrintFormat("Losses: %d | Stake: %.4f | Has Position: %s",
+                  consecutive_losses, current_stake, has_position ? "YES" : "NO");
+      PrintFormat("===================");
+   }
+
+   // Execute CALL trade
+   if(call_conditions)
+   {
+      ExecuteTrade(ORDER_TYPE_BUY, current_stake);
+      tick_counter = 3; // Set cooldown of 3 ticks
+      last_trade_type = ORDER_TYPE_BUY;
+      return;
+   }
+
+   // Execute PUT trade
+   if(put_conditions)
+   {
+      ExecuteTrade(ORDER_TYPE_SELL, current_stake);
+      tick_counter = 3; // Set cooldown of 3 ticks
+      last_trade_type = ORDER_TYPE_SELL;
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Function: Execute Trade                                         |
+//+------------------------------------------------------------------+
+bool ExecuteTrade(ENUM_ORDER_TYPE order_type, double lot_size)
+{
+   MqlTradeRequest request;
+   MqlTradeResult result;
+
+   ZeroMemory(request);
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lot_size;
+   request.type = order_type;
+   request.price = (order_type == ORDER_TYPE_BUY) ? latest_tick.ask : latest_tick.bid;
+   request.deviation = 100;
+   request.comment = StringFormat("Bot Trade - Lot: %.4f", lot_size);
+
+   if(!OrderSend(request, result))
+   {
+      PrintFormat("Trade failed: %s", result.comment);
+      return false;
+   }
+
+   last_deal_ticket = result.deal;
+   last_trade_time = TimeCurrent();
+
+   PrintFormat("TRADE EXECUTED - Type: %s | Lot: %.4f | Price: %.5f | Ticket: %llu",
+               (order_type == ORDER_TYPE_BUY) ? "BUY" : "SELL",
+               lot_size, request.price, result.deal);
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Function: Check for Open Positions                              |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int total_positions = PositionsTotal();
+   for(int i = 0; i < total_positions; i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Event Handler: Trade Events - AFTER DEAL CLOSES                 |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                       const MqlTradeRequest &request,
+                       const MqlTradeResult &result)
+{
+   // Only process deal transactions
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   // Only process our symbol
+   if(trans.symbol != _Symbol)
+      return;
+
+   // Check if deal was BUY or SELL
+   if(trans.deal_type != DEAL_TYPE_BUY && trans.deal_type != DEAL_TYPE_SELL)
+      return;
+
+   // Get deal details
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   double deal_profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   double deal_volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+   double deal_price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+
+   PrintFormat("\n*** DEAL CLOSED ***");
+   PrintFormat("Deal Ticket: %llu | Volume: %.4f | Price: %.5f | Profit: %.2f",
+               trans.deal, deal_volume, deal_price, deal_profit);
+
+   // ========== WIN CONDITION ==========
+   if(deal_profit > 0)
+   {
+      PrintFormat("*** WIN *** | Profit: %.2f", deal_profit);
+      
+      // Reset stake to base
+      current_stake = base_stake;
+      
+      // Reset consecutive losses counter
+      consecutive_losses = 0;
+      
+      PrintFormat("RESET: Stake = %.4f | Consecutive Losses = 0", current_stake);
+   }
+   // ========== LOSS CONDITION ==========
+   else if(deal_profit <= 0)
+   {
+      consecutive_losses++;
+      PrintFormat("*** LOSS *** | Loss: %.2f | Consecutive Losses: %d", deal_profit, consecutive_losses);
+
+      // Check if we reached 3 consecutive losses
+      if(consecutive_losses >= 3)
+      {
+         // RESET to base stake and reset loss counter
+         PrintFormat("!!! 3 CONSECUTIVE LOSSES REACHED - RESETTING STAKE !!!");
+         current_stake = base_stake;
+         consecutive_losses = 0;
+         PrintFormat("RESET: Stake = %.4f | Consecutive Losses = 0", current_stake);
+      }
+      else
+      {
+         // Apply martingale multiplier
+         current_stake = current_stake * martingale_multiplier;
+         PrintFormat("MARTINGALE: New Stake = %.4f (Multiplier: %.2f)", current_stake, martingale_multiplier);
+      }
+   }
+
+   PrintFormat("*** END DEAL ***\n");
+}
+
+//+------------------------------------------------------------------+
