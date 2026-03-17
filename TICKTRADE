@@ -13,9 +13,12 @@
 
 #include <Trade/Trade.mqh>
 
+//--- EA Identification
+#define EA_MAGIC_NUMBER 20240001   // Unique magic number for this EA
+
 //--- Global Variables (Initialization)
-double base_stake = 1.0;           // Initial stake (in lots or points)
-double current_stake = 1.0;        // Current trading stake
+double base_stake = 0.01;          // Initial stake (in lots) - use broker minimum by default
+double current_stake = 0.01;       // Current trading stake
 int tick_counter = 0;              // Cooldown counter (3 ticks after trade)
 double martingale_multiplier = 2.1; // Multiplier for martingale on loss
 
@@ -69,10 +72,108 @@ ENUM_ORDER_TYPE last_trade_type = ORDER_TYPE_BUY;
 MqlTick latest_tick;
 
 //+------------------------------------------------------------------+
+//| Helper: Normalize lot size to broker specifications             |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double lots)
+{
+   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lot_step <= 0)
+   {
+      PrintFormat("Warning: SYMBOL_VOLUME_STEP returned %.6f for %s; falling back to 0.01", lot_step, _Symbol);
+      lot_step = 0.01;
+   }
+
+   // Round to nearest lot step
+   lots = MathRound(lots / lot_step) * lot_step;
+
+   // Clamp within broker limits
+   lots = MathMax(lots, min_lot);
+   lots = MathMin(lots, max_lot);
+
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Validate pre-trade account and market conditions        |
+//+------------------------------------------------------------------+
+bool ValidateTradingConditions()
+{
+   // Check if trading is allowed on the account
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      Print("Trading is not allowed on this account (ACCOUNT_TRADE_ALLOWED=false)");
+      return false;
+   }
+
+   // Check if automated trading is enabled on the account
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+   {
+      Print("Automated trading (Expert Advisors) is disabled on this account");
+      return false;
+   }
+
+   // Check if trading is allowed for the symbol
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
+   {
+      PrintFormat("Trading is not allowed for symbol %s", _Symbol);
+      return false;
+   }
+
+   // Check if the market is open (session is active)
+   datetime session_open = 0, session_close = 0;
+   if(SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)TimeDayOfWeek(TimeCurrent()),
+                             0, session_open, session_close))
+   {
+      // session_open and session_close are seconds elapsed from midnight (per MQL5 docs)
+      // TimeCurrent() % 86400 converts current broker server time to seconds since midnight
+      datetime now = TimeCurrent() % 86400; // seconds within today
+      if(now < session_open || now > session_close)
+      {
+         PrintFormat("Market is closed for symbol %s at this time", _Symbol);
+         return false;
+      }
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Check free margin is sufficient for a trade             |
+//+------------------------------------------------------------------+
+bool CheckMargin(ENUM_ORDER_TYPE order_type, double lots)
+{
+   double price = (order_type == ORDER_TYPE_BUY) ? latest_tick.ask : latest_tick.bid;
+   double margin_required = 0.0;
+
+   if(!OrderCalcMargin(order_type, _Symbol, lots, price, margin_required))
+   {
+      PrintFormat("Cannot calculate required margin: error %d", GetLastError());
+      return false;
+   }
+
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(free_margin < margin_required)
+   {
+      PrintFormat("Insufficient margin: required=%.2f, available=%.2f",
+                  margin_required, free_margin);
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Expert Initialization Function                                  |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Configure CTrade object with magic number and deviation
+   trade.SetExpertMagicNumber(EA_MAGIC_NUMBER);
+   trade.SetDeviationInPoints(100);
+
    // Initialize Bollinger Bands
    handle_bb = iBands(_Symbol, _Period, bb_period, 0, bb_dev_up, PRICE_CLOSE);
    if(handle_bb == INVALID_HANDLE)
@@ -105,15 +206,17 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // Initialize variables
-   base_stake = 1.0;
+   // Determine broker-compliant base stake; NormalizeLotSize clamps to SYMBOL_VOLUME_MIN
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   base_stake = NormalizeLotSize(0.01);
    current_stake = base_stake;
    martingale_multiplier = 2.1;
    tick_counter = 0;
    consecutive_losses = 0;
 
-   PrintFormat("Expert Advisor initialized successfully");
-   PrintFormat("Base Stake: %.2f, Multiplier: %.2f", base_stake, martingale_multiplier);
+   PrintFormat("Expert Advisor initialized successfully. Magic: %d", EA_MAGIC_NUMBER);
+   PrintFormat("Base Stake: %.2f (BrokerMin: %.2f) | Multiplier: %.2f",
+               base_stake, min_lot, martingale_multiplier);
 
    return INIT_SUCCEEDED;
 }
@@ -277,30 +380,61 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool ExecuteTrade(ENUM_ORDER_TYPE order_type, double lot_size)
 {
-   MqlTradeRequest request;
-   MqlTradeResult result;
+   // Pre-trade validations
+   if(!ValidateTradingConditions())
+      return false;
 
-   ZeroMemory(request);
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = _Symbol;
-   request.volume = lot_size;
-   request.type = order_type;
-   request.price = (order_type == ORDER_TYPE_BUY) ? latest_tick.ask : latest_tick.bid;
-   request.deviation = 100;
-   request.comment = StringFormat("Bot Trade - Lot: %.4f", lot_size);
+   // Normalize lot size to broker specifications
+   lot_size = NormalizeLotSize(lot_size);
+   PrintFormat("Normalized lot size: %.2f", lot_size);
 
-   if(!OrderSend(request, result))
+   // Verify sufficient margin before placing the trade
+   if(!CheckMargin(order_type, lot_size))
+      return false;
+
+   bool success = false;
+   if(order_type == ORDER_TYPE_BUY)
    {
-      PrintFormat("Trade failed: %s", result.comment);
+      // SL/TP are 0 (disabled) intentionally: this Martingale EA manages risk via
+      // the 3-loss reset and stake sizing rather than fixed stop levels.
+      success = trade.Buy(lot_size, _Symbol, 0, 0, 0,
+                          StringFormat("Bot BUY - Lot: %.2f Magic: %d", lot_size, EA_MAGIC_NUMBER));
+   }
+   else
+   {
+      // SL/TP are 0 (disabled) intentionally: see note above.
+      success = trade.Sell(lot_size, _Symbol, 0, 0, 0,
+                           StringFormat("Bot SELL - Lot: %.2f Magic: %d", lot_size, EA_MAGIC_NUMBER));
+   }
+
+   if(!success)
+   {
+      int err = trade.ResultRetcode();
+      PrintFormat("Trade FAILED - Type: %s | Lot: %.2f | Error: %d (%s)",
+                  (order_type == ORDER_TYPE_BUY) ? "BUY" : "SELL",
+                  lot_size, err, trade.ResultRetcodeDescription());
+
+      // Log specific actionable error codes
+      switch(err)
+      {
+         case 134: Print(">> Insufficient funds (error 134). Reduce lot size or deposit funds."); break;
+         case 131: Print(">> Invalid volume (error 131). Lot size violates broker step/min/max."); break;
+         case 130: Print(">> Invalid SL/TP distance (error 130)."); break;
+         case 4107: Print(">> Invalid price (error 4107). Tick data may be stale."); break;
+         case 10004: Print(">> Requote (10004). Increase deviation or retry."); break;
+         case 10014: Print(">> Invalid volume (10014). Check SYMBOL_VOLUME_MIN/MAX/STEP."); break;
+         case 10019: Print(">> Not enough money (10019). Check AccountFreeMargin."); break;
+         default: break;
+      }
       return false;
    }
 
-   last_deal_ticket = result.deal;
+   last_deal_ticket = trade.ResultDeal();
    last_trade_time = TimeCurrent();
 
-   PrintFormat("TRADE EXECUTED - Type: %s | Lot: %.4f | Price: %.5f | Ticket: %llu",
+   PrintFormat("TRADE EXECUTED - Type: %s | Lot: %.2f | Price: %.5f | Ticket: %llu",
                (order_type == ORDER_TYPE_BUY) ? "BUY" : "SELL",
-               lot_size, request.price, result.deal);
+               lot_size, trade.ResultPrice(), last_deal_ticket);
 
    return true;
 }
@@ -382,9 +516,20 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       }
       else
       {
-         // Apply martingale multiplier
-         current_stake = current_stake * martingale_multiplier;
-         PrintFormat("MARTINGALE: New Stake = %.4f (Multiplier: %.2f)", current_stake, martingale_multiplier);
+         // Apply martingale multiplier only if sufficient margin is available
+         double next_stake = NormalizeLotSize(current_stake * martingale_multiplier);
+         if(CheckMargin(last_trade_type, next_stake))
+         {
+            current_stake = next_stake;
+            PrintFormat("MARTINGALE: New Stake = %.2f (Multiplier: %.2f)", current_stake, martingale_multiplier);
+         }
+         else
+         {
+            // Insufficient margin for martingale escalation - reset to base stake
+            PrintFormat("MARTINGALE SKIPPED: Insufficient margin for stake %.2f. Resetting to base stake.", next_stake);
+            current_stake = base_stake;
+            consecutive_losses = 0;
+         }
       }
    }
 
