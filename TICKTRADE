@@ -124,7 +124,9 @@ bool ValidateTradingConditions()
 
    // Check if the market is open (session is active)
    datetime session_open = 0, session_close = 0;
-   if(SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)TimeDayOfWeek(TimeCurrent()),
+   datetime current_time = TimeCurrent();
+   ENUM_DAY_OF_WEEK day_of_week = (ENUM_DAY_OF_WEEK)TimeDayOfWeek(current_time);
+   if(SymbolInfoSessionTrade(_Symbol, day_of_week,
                              0, session_open, session_close))
    {
       // session_open and session_close are seconds elapsed from midnight (per MQL5 docs)
